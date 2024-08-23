@@ -12,13 +12,78 @@
 #include <ArduinoJson.h>        // https://github.com/bblanchon/ArduinoJson
 #include <HTTPClient.h>         // In-built
 
-#include <WiFi.h>               // In-built
+//#include <WiFi.h>               // In-built
 #include <SPI.h>                // In-built
 #include <time.h>               // In-built
+#include <UrlEncode.h>
 
+#include "Button2.h"
 #include "owm_credentials.h"
 #include "forecast_record.h"
 #include "lang.h"
+
+//################  IOTWEBCONF  ##################################################
+
+#include <IotWebConf.h>
+#include <IotWebConfUsing.h> // This loads aliases for easier class names.
+
+
+#define BATT_PIN            36
+
+//Looking at screen the buttons are:
+//      _________--__--__--__--__--_____________
+//      |                                      |
+//Button #        1   2   3   4   5
+//Function       RS   ?  b3  b4  b5
+//SCHM LABEL     S5  S6  S3  S2  S4
+//GPIO           NA   ?  35  34  39
+//PIN             3  25   7   6   5
+//Extern PU?      Y   N   Y   Y   Y
+//Usable?         N   N   Y   Y   Y
+
+
+#define BUTTON_3            35 //S3 GPIO35 SENSOR_VN
+#define BUTTON_4            34 //S2 GPIO34
+#define BUTTON_5            39 //S4 GPIO39
+
+
+const char* stateStr[] = {"Boot","NotConfigured","ApMode","Connecting","OnLine","OffLine"};
+
+// -- Initial name of the Thing. Used e.g. as SSID of the own Access Point.
+const char thingName[] = "Weather ePaper";
+
+// -- Initial password to connect to the Thing, when it creates an own Access Point.
+const char wifiInitialApPassword[] = "glaser1980";
+
+// -- When CONFIG_PIN is pulled to ground on startup, the Thing will use the initial
+//      password to buld an AP. (E.g. in case of lost password)
+#define CONFIG_PIN BUTTON_4
+
+// -- Status indicator pin.
+//      First it will light up (kept LOW), on Wifi connection it will blink,
+//      when connected to the Wifi it will turn off (kept HIGH).
+#define STATUS_PIN LED_BUILTIN
+
+// -- Callback declarations
+void handleRoot_cb();
+void configSaved_cb();
+bool formValidator_cb(iotwebconf::WebRequestWrapper* webRequestWrapper);
+
+DNSServer dnsServer;
+WebServer server(80);
+
+IotWebConf iotWebConf(thingName, &dnsServer, &server, wifiInitialApPassword, CONFIG_VERSION);
+
+
+char ipAddressValue[25];
+char gatewayValue[25];
+char netmaskValue[25];
+
+IPAddress ipAddress;
+IPAddress gateway;
+IPAddress netmask;
+
+//################  IORWEBCONF  ##################################################
 
 #define SCREEN_WIDTH   EPD_WIDTH
 #define SCREEN_HEIGHT  EPD_HEIGHT
@@ -39,7 +104,9 @@ enum alignment {LEFT, RIGHT, CENTER};
 #define barchart_on   true
 #define barchart_off  false
 
-boolean LargeIcon   = true;
+
+boolean 
+LargeIcon   = true;
 boolean SmallIcon   = false;
 #define Large  20           // For icon drawing
 #define Small  8            // For icon drawing
@@ -48,6 +115,7 @@ String  Date_str = "-- --- ----";
 int     wifi_signal, CurrentHour = 0, CurrentMin = 0, CurrentSec = 0, EventCnt = 0, vref = 1100;
 //################ PROGRAM VARIABLES and OBJECTS ##########################################
 #define max_readings 24 // Limited to 3-days here, but could go to 5-days = 40  
+#define max_forecast_icons 7
 
 Forecast_record_type  WxConditions[1];
 Forecast_record_type  WxForecast[max_readings];
@@ -65,60 +133,110 @@ long StartTime       = 0;
 long SleepTimer      = 0;
 long Delta           = 30; // ESP32 rtc speed compensation, prevents display at xx:59:yy and then xx:00:yy (one minute later) to save power
 
+boolean configDisplayed = false;
+bool firstTime = true;
+
 //fonts
-#include "opensans8b.h"
-#include "opensans10b.h"
-#include "opensans12b.h"
-#include "opensans18b.h"
-#include "opensans24b.h"
+#include "fonts/opensans8b.h"
+#include "fonts/opensans10b.h"
+#include "fonts/opensans12b.h"
+#include "fonts/opensans14b.h"
+#include "fonts/opensans18b.h"
+#include "fonts/opensans24b.h"
 
 GFXfont  currentFont;
 uint8_t *framebuffer;
 
-void BeginSleep() {
+//Button2  btn4(BUTTON_5,"btn5");   //right most
+
+boolean UpdateLocalTime();
+
+void BeginSleep(bool setWakeup = true) {
   epd_poweroff_all();
-  UpdateLocalTime();
-  SleepTimer = (SleepDuration * 60 - ((CurrentMin % SleepDuration) * 60 + CurrentSec)) + Delta; //Some ESP32 have a RTC that is too fast to maintain accurate time, so add an offset
-  esp_sleep_enable_timer_wakeup(SleepTimer * 1000000LL); // in Secs, 1000000LL converts to Secs as unit = 1uSec
+  if (setWakeup) {
+    UpdateLocalTime();
+    SleepTimer = (SleepDuration * 60 - ((CurrentMin % SleepDuration) * 60 + CurrentSec)) + Delta; //Some ESP32 have a RTC that is too fast to maintain accurate time, so add an offset
+    esp_sleep_enable_timer_wakeup(SleepTimer * 1000000LL); // in Secs, 1000000LL converts to Secs as unit = 1uSec
+    Serial.println("Entering " + String(SleepTimer) + " (secs) of sleep time");
+  }
   Serial.println("Awake for : " + String((millis() - StartTime) / 1000.0, 3) + "-secs");
-  Serial.println("Entering " + String(SleepTimer) + " (secs) of sleep time");
   Serial.println("Starting deep-sleep period...");
+  
+  //Wake up if the button is clisked in deep sleep.
+  esp_sleep_enable_ext1_wakeup(GPIO_SEL_35, ESP_EXT1_WAKEUP_ALL_LOW); //the third button from the left.  
   esp_deep_sleep_start();  // Sleep for e.g. 30 minutes
 }
 
 boolean SetupTime() {
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer, "time.nist.gov"); //(gmtOffset_sec, daylightOffset_sec, ntpServer)
-  setenv("TZ", Timezone, 1);  //setenv()adds the "TZ" variable to the environment with a value TimeZone, only used if set to 1, 0 means no change
+  configTime(gmtOffsetParam.value(), daylightOffsetParam.value(), ntpServerParam.value(), "time.nist.gov"); //(gmtOffset_sec, daylightOffset_sec, ntpServer)
+  setenv("TZ", timeTimezoneParam.value(), 1);  //setenv()adds the "TZ" variable to the environment with a value TimeZone, only used if set to 1, 0 means no change
   tzset(); // Set the TZ environment variable
   delay(100);
   return UpdateLocalTime();
 }
 
-uint8_t StartWiFi() {
-  Serial.println("\r\nConnecting to: " + String(ssid));
-  IPAddress dns(8, 8, 8, 8); // Use Google DNS
-  WiFi.disconnect();
-  WiFi.mode(WIFI_STA); // switch off AP
-  WiFi.setAutoConnect(true);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(ssid, password);
-  if (WiFi.waitForConnectResult() != WL_CONNECTED) {
-    Serial.printf("STA: Failed!\n");
-    WiFi.disconnect(false);
-    delay(500);
-    WiFi.begin(ssid, password);
+
+/**
+ * Handle web requests to "/" path.
+ */
+void handleRoot_cb()
+{
+  // -- Let IotWebConf test and handle captive portal requests.
+  if (iotWebConf.handleCaptivePortal())
+  {
+    // -- Captive portal request were already served.
+    return;
   }
-  if (WiFi.status() == WL_CONNECTED) {
-    wifi_signal = WiFi.RSSI(); // Get Wifi Signal strength now, because the WiFi will be turned off to save power!
-    Serial.println("WiFi connected at: " + WiFi.localIP().toString());
+
+  String s = "<!DOCTYPE html><html lang=\"en\"><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, user-scalable=no\"/>";
+  s += "<title>Weather ePaper</title></head><body><div>Status page of ";
+  s += iotWebConf.getThingName();
+  s += ".</div>";
+  s += "<ul>";
+  s += "<li>OWM City Name:<br>";
+  s += owmCityNameParam.value();
+  s += "<li>OWM Country (2 letter):<br>";
+  s += owmCountry2LetterParam.value();
+  s += "<li>OWM Api Key param value:<br>";
+  s += owmApiKeyParam.value();
+  s += "</ul>";
+  s += "Go to <a href='config'>configure page</a> to change values.";
+  s += "</body></html>\n";
+
+  server.send(200, "text/html", s);
+}
+
+void configSaved_cb()
+{
+  Serial.println("Configuration was updated.");
+}
+
+bool formValidator_cb(iotwebconf::WebRequestWrapper* webRequestWrapper)
+{
+  Serial.println("Validating form.");
+  bool valid = true;
+  String msg;
+
+  int l = webRequestWrapper->arg(owmApiKeyParam.getId()).length();
+  if (l != owmApiKey_LEN-1)
+  {
+    msg = "Please provide exactly " + String(owmApiKey_LEN-1) + " characters for the Api Key";
+    owmApiKeyParam.errorMessage = msg.c_str();
+    valid = false;
   }
-  else Serial.println("WiFi connection *** FAILED ***");
-  return WiFi.status();
+
+  return valid;
+}
+
+void wifiConnected_cb()
+{
+  Serial.println("WiFi was connected.");
 }
 
 void StopWiFi() {
-  WiFi.disconnect();
-  WiFi.mode(WIFI_OFF);
+  iotWebConf.goOffLine();
+  //WiFi.disconnect();
+  //WiFi.mode(WIFI_OFF);
   Serial.println("WiFi switched Off");
 }
 
@@ -133,41 +251,154 @@ void InitialiseSystem() {
   memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
 }
 
-void loop() {
-  // Nothing to do here
+void buttonPressed_cb(Button2 &b)
+{
+    Serial.println("Button " + b.getButtonName() + "Clicks = " + b.getNumberOfClicks());
 }
 
 void setup() {
+  //Setup the button callback (only used when not deep sleeping (on battery power))
+  //btn4.setPressedHandler(buttonPressed_cb);
   InitialiseSystem();
-  if (StartWiFi() == WL_CONNECTED && SetupTime() == true) {
-    bool WakeUp = false;                
-    if (WakeupHour > SleepHour)
-      WakeUp = (CurrentHour >= WakeupHour || CurrentHour <= SleepHour); 
-    else                             
-      WakeUp = (CurrentHour >= WakeupHour && CurrentHour <= SleepHour);                              
-    if (WakeUp) {
-      byte Attempts = 1;
-      bool RxWeather  = false;
-      bool RxForecast = false;
-      WiFiClient client;   // wifi client object
-      while ((RxWeather == false || RxForecast == false) && Attempts <= 2) { // Try up-to 2 time for Weather and Forecast data
-        if (RxWeather  == false) RxWeather  = obtainWeatherData(client, "weather");
-        if (RxForecast == false) RxForecast = obtainWeatherData(client, "forecast");
-        Attempts++;
+
+  //Clear off the screen...
+  //epd_poweron();      // Switch on EPD display
+  //epd_clear();        // Clear the screen
+  //epd_poweroff_all(); // Switch off all power to EPD
+
+  //###################### IOTWebConf ###############################
+  // ambGroup.addItem(&ambientApiKeyParam);
+  // ambGroup.addItem(&ambientAppKeyParam);
+  // ambGroup.addItem(&ambientDeviceMacParam);
+  // ambGroup.addItem(&ambientApiEndpointParam);
+  // iotWebConf.addParameterGroup(&ambGroup);
+
+  owmGroup.addItem(&owmApiKeyParam);
+  owmGroup.addItem(&owmWxServerParam);
+  owmGroup.addItem(&owmCityNameParam);
+  owmGroup.addItem(&owmCountry2LetterParam);
+  owmGroup.addItem(&owmUnitsParam);
+  owmGroup.addItem(&owmLanguageParam);
+  owmGroup.addItem(&owmHemisphereParam); 
+  iotWebConf.addParameterGroup(&owmGroup);
+
+  timeGroup.addItem(&timeTimezoneParam);
+  timeGroup.addItem(&ntpServerParam);
+  timeGroup.addItem(&gmtOffsetParam);
+  timeGroup.addItem(&daylightOffsetParam);
+  iotWebConf.addParameterGroup(&timeGroup);
+
+  iotWebConf.setConfigSavedCallback(&configSaved_cb);
+  iotWebConf.setFormValidator(&formValidator_cb);
+  iotWebConf.setWifiConnectionCallback(&wifiConnected_cb);
+
+  iotWebConf.setStatusPin(13); //nothing, there is no LED to blink.
+  iotWebConf.setConfigPin(BUTTON_4); //sw2 (second in from the right)
+  iotWebConf.skipApStartup(); //skip right to connecting the configured WiFi
+
+  // -- Initializing the configuration.
+  iotWebConf.init();
+
+  // -- Set up required URL handlers on the web server.
+  server.on("/", handleRoot_cb);
+  server.on("/config", []{ iotWebConf.handleConfig(); });
+  server.onNotFound([](){ iotWebConf.handleNotFound(); });
+}
+
+
+void loop() {
+  //btn4.loop();
+  iotWebConf.doLoop();
+  Serial.print("State = ");
+  Serial.println(stateStr[iotWebConf.getState()]);
+
+  if (iotWebConf.getState()==iotwebconf::NetworkState::OnLine) {
+    Serial.println("Now OnLine...");
+    if (SetupTime() == true)
+    {
+      bool WakeUp = false;                
+      if (WakeupHour > SleepHour)
+        WakeUp = (CurrentHour >= WakeupHour || CurrentHour <= SleepHour); 
+      else                             
+        WakeUp = (CurrentHour >= WakeupHour && CurrentHour <= SleepHour);                              
+      if (WakeUp || firstTime) {
+        firstTime = false;
+        Serial.println("In wakeup...");
+        int Attempts = 1;
+        bool RxWeather  = false;
+        bool RxForecast = false;
+        WiFiClient client;   // wifi client object
+        while ((RxWeather == false || RxForecast == false) && Attempts <= 5) { // Try up-to 5 times for Weather and Forecast data
+          if (RxWeather  == false) RxWeather  = obtainWeatherData(client, "weather");
+          if (RxForecast == false) RxForecast = obtainWeatherData(client, "forecast");
+          Attempts++;
+          delay(1000);
+          Serial.println("Attempts " + Attempts);
+        }
+        Serial.println("Received all weather data...");
+        if (RxWeather && RxForecast) { // Only if received both Weather or Forecast proceed
+          StopWiFi();         // Reduces power consumption
+          epd_poweron();      // Switch on EPD display
+          memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2); //wipe the framebuffer
+          DisplayWeather();   // Display the weather data
+          epd_clear();
+          edp_update();       // Update the display to show the information
+          epd_poweroff_all(); // Switch off all power to EPD
+        } else {
+          Serial.println("Did not get weather");
+        }
+      } else {
+        //No time to wake up, but leave the screen as it is.
+        Serial.println("Not wakeup period");
       }
-      Serial.println("Received all weather data...");
-      if (RxWeather && RxForecast) { // Only if received both Weather or Forecast proceed
-        StopWiFi();         // Reduces power consumption
-        epd_poweron();      // Switch on EPD display
-        epd_clear();        // Clear the screen
-        DisplayWeather();   // Display the weather data
-        edp_update();       // Update the display to show the information
-        epd_poweroff_all(); // Switch off all power to EPD
-      }
+      Serial.println("Going to sleep");
+      BeginSleep(true);
+    }
+  } else if ((iotWebConf.getState()==iotwebconf::NetworkState::ApMode) ||
+             (iotWebConf.getState()==iotwebconf::NetworkState::NotConfigured)) {
+    Serial.print("State = ");
+    Serial.println(stateStr[iotWebConf.getState()]);
+    long timeAwakeSecs = long((millis() - StartTime) / 1000.0);
+    if (!configDisplayed){
+      Serial.println("Awake for : " + String((millis() - StartTime) / 1000.0, 3) + "-secs");
+      Serial.println("Displaying config message");
+      //Clear the screen
+      epd_poweron();      // Switch on EPD display
+      memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2); //wipe the framebuffer
+      DisplayConfigurationInstructions();
+      epd_clear();
+      edp_update(2);       // Update the display to show the information
+      epd_poweroff_all(); // Switch off all power to EPD
+      configDisplayed = true;
+    } else if (configDisplayed && timeAwakeSecs >= (60*3)){
+      Serial.println("Displaying config sleep message");
+      //Configuration has not been done for 3 minutes, shutdown.
+      //Wake up if the button is clicked in deep sleep.
+      epd_poweron();      // Switch on EPD display
+      DisplaySleepNotice();
+      edp_update(2);       // Update the display to show the information
+      epd_poweroff_all(); // Switch off all power to EPD
+
+      BeginSleep(false);
+    } 
+  } else { //in odd state
+    long timeAwakeSecs = long((millis() - StartTime) / 1000.0);
+    Serial.println("Awake for : " + String((millis() - StartTime) / 1000.0, 3) + "-secs");
+    Serial.println("In odd state");
+    Serial.print("State = ");
+    Serial.println(stateStr[iotWebConf.getState()]);
+    
+    //if you have been in these odd states for more than 5 minutes, shut down.
+    if (timeAwakeSecs >= (60*5)){
+      Serial.print("State = ");
+      Serial.println(stateStr[iotWebConf.getState()]);
+      Serial.println("Going into Deep Sleep");
+      BeginSleep(false);
     }
   }
-  BeginSleep();
+  iotWebConf.delay(1000);
 }
+
 
 void Convert_Readings_to_Imperial() { // Only the first 3-hours are used
   WxConditions[0].Pressure = hPa_to_inHg(WxConditions[0].Pressure);
@@ -218,7 +449,7 @@ bool DecodeWeather(WiFiClient& json, String Type) {
     JsonArray list                  = root["list"];
     for (byte r = 0; r < max_readings; r++) {
       Serial.println("\nPeriod-" + String(r) + "--------------");
-      WxForecast[r].Dt                = list[r]["dt"].as<int>();
+      WxForecast[r].Dt                = list[r]["dt"].as<int>();                          Serial.println("UDt : " + String(ConvertUnixTime(WxForecast[r].Dt + WxConditions[0].Timezone)));
       WxForecast[r].Temperature       = list[r]["main"]["temp"].as<float>();              Serial.println("Temp: " + String(WxForecast[r].Temperature));
       WxForecast[r].Low               = list[r]["main"]["temp_min"].as<float>();          Serial.println("TLow: " + String(WxForecast[r].Low));
       WxForecast[r].High              = list[r]["main"]["temp_max"].as<float>();          Serial.println("THig: " + String(WxForecast[r].High));
@@ -244,7 +475,7 @@ bool DecodeWeather(WiFiClient& json, String Type) {
     if (pressure_trend < 0)  WxConditions[0].Trend = "-";
     if (pressure_trend == 0) WxConditions[0].Trend = "0";
 
-    if (Units == "I") Convert_Readings_to_Imperial();
+    if (strcmp(owmUnitsParam.value(),"I")==0) Convert_Readings_to_Imperial();
   }
   return true;
 }
@@ -254,7 +485,7 @@ String ConvertUnixTime(int unix_time) {
   time_t tm = unix_time;
   struct tm *now_tm = localtime(&tm);
   char output[40];
-  if (Units == "M") {
+  if (strcmp(owmUnitsParam.value(),"M")==0) {
     strftime(output, sizeof(output), "%H:%M %d/%m/%y", now_tm);
   }
   else {
@@ -262,33 +493,78 @@ String ConvertUnixTime(int unix_time) {
   }
   return output;
 }
+
+// //#########################################################################################
+// bool obtainAmbientWeatherData(WiFiClient & client, const String & RequestType) {
+//   const String units = (strcmp(owmUnitsParam.value(),"M")==0 ? "metric" : "imperial");
+//   client.stop(); // close connection before sending a new request
+//   HTTPClient http;
+//   String uri = "https://api.ambientweather.net/v1/devices/DC:4F:22:5A:C1:36?applicationKey=b4bebeed184a4c7b97fe9326995f4781e68d73e501854b6287351d0079c4122f&apiKey=e111635001b140059ec8e329d0981dbf39c0e2fddbe9430f990c73355b8363e1";
+// //  String deviceString = "/v1/devices";
+// //  if (RequestType != "current")
+// //  {
+// //    //https://api.ambientweather.net/v1/devices?applicationKey=&apiKey=
+// //    deviceString = deviceString + "/" + ambientDeviceMacParam.value();
+// //  }
+// //  uri = "https://" + ambientApiEndpointParam.value() + deviceString + uri;
+
+// //  Serial.println("URI = " + uri);
+//   http.begin(uri, root_ca); //http.begin(uri,test_root_ca); //HTTPS example connection
+//   http.begin(client, "api.ambientweather.net", 4
+//   43, "/v1/devices/DC:4F:22:5A:C1:36?applicationKey=b4bebeed184a4c7b97fe9326995f4781e68d73e501854b6287351d0079c4122f&apiKey=e111635001b140059ec8e329d0981dbf39c0e2fddbe9430f990c73355b8363e1"); //http.begin(uri,test_root_ca); //HTTPS example connection
+//   int httpCode = http.GET();
+//   if (httpCode == HTTP_CODE_OK) {
+//     //if (!DecodeWeather(http.getStream(), RequestType)) return false;
+//     Serial.println("http GET success");
+//     client.stop();
+//     http.end();
+//     return true;
+//   }
+//   else
+//   {
+//     Serial.print("connection failed, error:" + String(httpCode));
+//     Serial.printf("                   error: %s", http.errorToString(httpCode).c_str());
+//     client.stop();
+//     http.end();
+//     return false;
+//   }
+//   http.end();
+//   return true;
+// }
+
+
 //#########################################################################################
 bool obtainWeatherData(WiFiClient & client, const String & RequestType) {
-  const String units = (Units == "M" ? "metric" : "imperial");
+  const String units = (strcmp(owmUnitsParam.value(),"M")==0 ? "metric" : "imperial");
   client.stop(); // close connection before sending a new request
   HTTPClient http;
-  String uri = "/data/2.5/" + RequestType + "?q=" + City + "," + Country + "&APPID=" + apikey + "&mode=json&units=" + units + "&lang=" + Language;
+  String uri = "/data/2.5/" + RequestType + "?q=" + urlEncode(owmCityNameParam.value()) + "," + owmCountry2LetterParam.value() + "&APPID=" + owmApiKeyParam.value() + "&mode=json&units=" + units + "&lang=" + owmLanguageParam.value();
   if (RequestType != "weather")
   {
     uri += "&cnt=" + String(max_readings);
   }
-  http.begin(client, server, 80, uri); //http.begin(uri,test_root_ca); //HTTPS example connection
+  Serial.print("URL=");
+  Serial.print(owmWxServerParam.value());
+  Serial.println(uri);
+
+  http.begin(client, owmWxServerParam.value(), 80, uri, false); //http.begin(uri,test_root_ca); //HTTPS example connection
   int httpCode = http.GET();
+  bool decodeSuccess = false;
   if (httpCode == HTTP_CODE_OK) {
-    if (!DecodeWeather(http.getStream(), RequestType)) return false;
-    client.stop();
+    decodeSuccess = DecodeWeather(http.getStream(), RequestType);
     http.end();
-    return true;
+    client.stop();
+    return decodeSuccess;
   }
   else
   {
-    Serial.printf("connection failed, error: %s", http.errorToString(httpCode).c_str());
-    client.stop();
+    //Serial.printf("connection failed, error: %s", http.errorToString(httpCode).c_str());
+    Serial.print("Connection failed, error: ");
+    Serial.println(httpCode);
     http.end();
+    client.stop();
     return false;
   }
-  http.end();
-  return true;
 }
 
 float mm_to_inches(float value_mm) {
@@ -337,6 +613,19 @@ double NormalizedMoonPhase(int d, int m, int y) {
   return (Phase - (int) Phase);
 }
 
+
+void DisplayConfigurationInstructions() {
+  setFont(OpenSans14B);
+  drawString(480, 200, "If this screen persists, connect to \"" + String(thingName) +"\"" , CENTER);
+  drawString(480, 235, "via WiFi and configure the device." , CENTER);
+}
+
+void DisplaySleepNotice() {
+  setFont(OpenSans14B);
+  drawString(480, 300, "No configuration completed. The device is in sleep mode.", CENTER);
+  drawString(480, 335, "Click 1st or 3rd button to wake and retry.", CENTER);
+}
+
 void DisplayWeather() {                          // 4.7" e-paper display is 960x540 resolution
   DisplayStatusSection(600, 20, wifi_signal);    // Wi-Fi signal strength and Battery voltage
   DisplayGeneralInfoSection();                   // Top line of the display
@@ -349,9 +638,10 @@ void DisplayWeather() {                          // 4.7" e-paper display is 960x
 
 void DisplayGeneralInfoSection() {
   setFont(OpenSans10B);
-  drawString(5, 2, City, LEFT);
+  drawString(5, 2, owmCityNameParam.value(), LEFT);
   setFont(OpenSans8B);
-  drawString(500, 2, Date_str + "  @   " + Time_str, LEFT);
+  //drawString(500, 2, Date_str + "  @   " + Time_str, LEFT);
+  drawString(480, 2, Date_str + "  @   " + Time_str, LEFT);
 }
 
 void DisplayWeatherIcon(int x, int y) {
@@ -392,13 +682,16 @@ void DisplayDisplayWindSection(int x, int y, float angle, float windspeed, int C
   drawString(x, y + Cradius + 10,     TXT_S, CENTER);
   drawString(x - Cradius - 15, y - 5, TXT_W, CENTER);
   drawString(x + Cradius + 10, y - 5, TXT_E, CENTER);
-  drawString(x + 3, y + 50, String(angle, 0) + "°", CENTER);
-  setFont(OpenSans12B);
-  drawString(x, y - 50, WindDegToOrdinalDirection(angle), CENTER);
+ // drawString(x + 3, y + 50, String(angle, 0) + "°", CENTER);
+  drawString(x, y + 45, String(angle, 0) + "°", CENTER);
+  //setFont(OpenSans12B);
+  //drawString(x, y - 50, WindDegToOrdinalDirection(angle), CENTER);
   setFont(OpenSans24B);
-  drawString(x + 3, y - 18, String(windspeed, 1), CENTER);
+  //drawString(x + 3, y - 18, String(windspeed, 1), CENTER);
+  drawString(x, y - 30, String(windspeed, 1), CENTER);
   setFont(OpenSans12B);
-  drawString(x, y + 25, (Units == "M" ? "m/s" : "mph"), CENTER);
+  //drawString(x, y + 25, (Units == "M" ? "m/s" : "mph"), CENTER);
+  drawString(x, y + 10, (strcmp(owmUnitsParam.value(), "M")==0 ? "m/s" : "mph"), CENTER);
 }
 
 String WindDegToOrdinalDirection(float winddirection) {
@@ -444,7 +737,7 @@ void DisplayForecastTextSection(int x, int y) {
     p++;
     charCount++;
   }
-  if (WxForecast[0].Rainfall > 0) Wx_Description += " (" + String(WxForecast[0].Rainfall, 1) + String((Units == "M" ? "mm" : "in")) + ")";
+  if (WxForecast[0].Rainfall > 0) Wx_Description += " (" + String(WxForecast[0].Rainfall, 1) + String((strcmp(owmUnitsParam.value(),"M")==0 ? "mm" : "in")) + ")";
   //Wx_Description = wordWrap(Wx_Description, lineWidth);
   String Line1 = Wx_Description.substring(0, Wx_Description.indexOf("~"));
   String Line2 = Wx_Description.substring(Wx_Description.indexOf("~") + 1);
@@ -480,8 +773,8 @@ void DisplayAstronomySection(int x, int y) {
   const int day_utc    = now_utc->tm_mday;
   const int month_utc  = now_utc->tm_mon + 1;
   const int year_utc   = now_utc->tm_year + 1900;
-  drawString(x + 5, y + 70, MoonPhase(day_utc, month_utc, year_utc, Hemisphere), LEFT);
-  DrawMoon(x + 160, y - 15, day_utc, month_utc, year_utc, Hemisphere);
+  drawString(x + 5, y + 70, MoonPhase(day_utc, month_utc, year_utc, owmHemisphereParam.value()), LEFT);
+  DrawMoon(x + 160, y - 15, day_utc, month_utc, year_utc, owmHemisphereParam.value());
 }
 
 void DrawMoon(int x, int y, int dd, int mm, int yy, String hemisphere) {
@@ -553,13 +846,14 @@ void DisplayForecastSection(int x, int y) {
   int f = 0;
   do {
     DisplayForecastWeather(x, y, f);
+    Serial.println("Forecast Icon: " + String(f));
     f++;
-  } while (f < max_readings);
+  } while (f < min(max_readings, max_forecast_icons));
   int r = 0;
   do { // Pre-load temporary arrays with with data - because C parses by reference and remember that[1] has already been converted to I units
-    if (Units == "I") pressure_readings[r] = WxForecast[r].Pressure * 0.02953;   else pressure_readings[r] = WxForecast[r].Pressure;
-    if (Units == "I") rain_readings[r]     = WxForecast[r].Rainfall * 0.0393701; else rain_readings[r]     = WxForecast[r].Rainfall;
-    if (Units == "I") snow_readings[r]     = WxForecast[r].Snowfall * 0.0393701; else snow_readings[r]     = WxForecast[r].Snowfall;
+    if (strcmp(owmUnitsParam.value(),"I")==0) pressure_readings[r] = WxForecast[r].Pressure * 0.02953;   else pressure_readings[r] = WxForecast[r].Pressure;
+    if (strcmp(owmUnitsParam.value(),"I")==0) rain_readings[r]     = WxForecast[r].Rainfall * 0.0393701; else rain_readings[r]     = WxForecast[r].Rainfall;
+    if (strcmp(owmUnitsParam.value(),"I")==0) snow_readings[r]     = WxForecast[r].Snowfall * 0.0393701; else snow_readings[r]     = WxForecast[r].Snowfall;
     temperature_readings[r]                = WxForecast[r].Temperature;
     humidity_readings[r]                   = WxForecast[r].Humidity;
     r++;
@@ -569,13 +863,13 @@ void DisplayForecastSection(int x, int y) {
   int gy = (SCREEN_HEIGHT - gheight - 30);
   int gap = gwidth + gx;
   // (x,y,width,height,MinValue, MaxValue, Title, Data Array, AutoScale, ChartMode)
-  DrawGraph(gx + 0 * gap, gy, gwidth, gheight, 900, 1050, Units == "M" ? TXT_PRESSURE_HPA : TXT_PRESSURE_IN, pressure_readings, max_readings, autoscale_on, barchart_off);
-  DrawGraph(gx + 1 * gap, gy, gwidth, gheight, 10, 30,    Units == "M" ? TXT_TEMPERATURE_C : TXT_TEMPERATURE_F, temperature_readings, max_readings, autoscale_on, barchart_off);
+  DrawGraph(gx + 0 * gap, gy, gwidth, gheight, 900, 1050, strcmp(owmUnitsParam.value(),"M")==0 ? TXT_PRESSURE_HPA : TXT_PRESSURE_IN, pressure_readings, max_readings, autoscale_on, barchart_off);
+  DrawGraph(gx + 1 * gap, gy, gwidth, gheight, 10, 30,    strcmp(owmUnitsParam.value(),"M")==0 ? TXT_TEMPERATURE_C : TXT_TEMPERATURE_F, temperature_readings, max_readings, autoscale_on, barchart_off);
   DrawGraph(gx + 2 * gap, gy, gwidth, gheight, 0, 100,   TXT_HUMIDITY_PERCENT, humidity_readings, max_readings, autoscale_off, barchart_off);
   if (SumOfPrecip(rain_readings, max_readings) >= SumOfPrecip(snow_readings, max_readings))
-    DrawGraph(gx + 3 * gap + 5, gy, gwidth, gheight, 0, 30, Units == "M" ? TXT_RAINFALL_MM : TXT_RAINFALL_IN, rain_readings, max_readings, autoscale_on, barchart_on);
+    DrawGraph(gx + 3 * gap + 5, gy, gwidth, gheight, 0, 30, strcmp(owmUnitsParam.value(),"M")==0 ? TXT_RAINFALL_MM : TXT_RAINFALL_IN, rain_readings, max_readings, autoscale_on, barchart_on);
   else
-    DrawGraph(gx + 3 * gap + 5, gy, gwidth, gheight, 0, 30, Units == "M" ? TXT_SNOWFALL_MM : TXT_SNOWFALL_IN, snow_readings, max_readings, autoscale_on, barchart_on);
+    DrawGraph(gx + 3 * gap + 5, gy, gwidth, gheight, 0, 30, strcmp(owmUnitsParam.value(),"M")==0 ? TXT_SNOWFALL_MM : TXT_SNOWFALL_IN, snow_readings, max_readings, autoscale_on, barchart_on);
 }
 
 void DisplayConditionsSection(int x, int y, String IconName, bool IconSize) {
@@ -615,7 +909,7 @@ void DrawSegment(int x, int y, int o1, int o2, int o3, int o4, int o11, int o12,
 }
 
 void DrawPressureAndTrend(int x, int y, float pressure, String slope) {
-  drawString(x + 25, y - 10, String(pressure, (Units == "M" ? 0 : 1)) + (Units == "M" ? "hPa" : "in"), LEFT);
+  drawString(x + 25, y - 10, String(pressure, (strcmp(owmUnitsParam.value(),"M")==0 ? 0 : 1)) + (strcmp(owmUnitsParam.value(),"M")==0 ? "hPa" : "in"), LEFT);
   if      (slope == "+") {
     DrawSegment(x, y, 0, 0, 8, -8, 8, -8, 16, 0);
     DrawSegment(x - 1, y, 0, 0, 8, -8, 8, -8, 16, 0);
@@ -662,7 +956,7 @@ boolean UpdateLocalTime() {
   CurrentSec  = timeinfo.tm_sec;
   //See http://www.cplusplus.com/reference/ctime/strftime/
   Serial.println(&timeinfo, "%a %b %d %Y   %H:%M:%S");      // Displays: Saturday, June 24 2017 14:05:49
-  if (Units == "M") {
+  if (strcmp(owmUnitsParam.value(),"M")==0) {
     sprintf(day_output, "%s, %02u %s %04u", weekday_D[timeinfo.tm_wday], timeinfo.tm_mday, month_M[timeinfo.tm_mon], (timeinfo.tm_year) + 1900);
     strftime(update_time, sizeof(update_time), "%H:%M:%S", &timeinfo);  // Creates: '@ 14:05:49'   and change from 30 to 8 <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
     sprintf(time_output, "%s", update_time);
@@ -1000,6 +1294,7 @@ void DrawGraph(int x_pos, int y_pos, int gwidth, int gheight, float Y1Min, float
     } else {
       drawLine(last_x, last_y - 1, x2, y2 - 1, Black); // Two lines for hi-res display
       drawLine(last_x, last_y, x2, y2, Black);
+      drawLine(last_x, last_y + 1, x2, y2 + 1, Black); // Two lines for hi-res display
     }
     last_x = x2;
     last_y = y2;
@@ -1083,7 +1378,13 @@ void setFont(GFXfont const &font) {
 }
 
 void edp_update() {
-  epd_draw_grayscale_image(epd_full_screen(), framebuffer); // Update the screen
+   epd_draw_grayscale_image(epd_full_screen(), framebuffer); // Update the screen
+}
+
+void edp_update(int updateCount) {
+  for (int j = 0; j < updateCount; j++){
+     epd_draw_grayscale_image(epd_full_screen(), framebuffer); // Update the screen
+  }
 }
 /*
    1085 lines of code 28-01-2021
